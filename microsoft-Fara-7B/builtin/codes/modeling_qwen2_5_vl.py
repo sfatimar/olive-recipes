@@ -232,7 +232,29 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        if self.config._attn_implementation == "flash_attention_2":
+        # For ONNX export or eager mode, use simple attention without packed format
+        if self.config._attn_implementation == "eager" or torch.onnx.is_in_onnx_export():
+            # Standard scaled dot-product attention for ONNX compatibility
+            # query_states, key_states, value_states: [batch=1, seq_len, num_heads, head_dim]
+
+            # Transpose to [batch, num_heads, seq_len, head_dim]
+            q = query_states.transpose(1, 2)
+            k = key_states.transpose(1, 2)
+            v = value_states.transpose(1, 2)
+
+            # Attention weights: [batch, num_heads, seq_len, seq_len]
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+
+            if self.training and self.attention_dropout > 0.0:
+                attn_weights = torch.nn.functional.dropout(attn_weights, p=self.attention_dropout)
+
+            # Attention output: [batch, num_heads, seq_len, head_dim]
+            attn_output = torch.matmul(attn_weights, v)
+
+            # Transpose back: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]
+            attn_output = attn_output.transpose(1, 2).contiguous()
+        elif self.config._attn_implementation == "flash_attention_2":
             # Flash Attention 2: Use cu_seqlens for variable length attention
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
@@ -250,34 +272,8 @@ class Qwen2_5_VLVisionAttention(nn.Module):
                 is_causal=False,
                 **kwargs,
             )
-        elif torch.compiler.is_exporting():
-            # ONNX export: emit a custom PackedAttention op node directly.
-            # Olive's PackedAttentionToLoopMHA surgery will replace this in the ONNX graph.
-            attn_output = torch.onnx.ops.symbolic(
-                "custom::PackedAttention",
-                (
-                    query_states,
-                    key_states,
-                    value_states,
-                    cu_seqlens,
-                ),
-                dict(
-                    scale=self.scaling,
-                    num_heads=self.num_heads,
-                ),
-                dtype=query_states.dtype,
-                shape=(
-                    query_states.shape[0],  # batch_size
-                    query_states.shape[2],  # sequence_length
-                    query_states.shape[1],  # num_heads
-                    query_states.shape[3],  # head_size
-                ),
-                version=1,
-            )
-            # ONNX symbolic outputs default to CPU; move to projection weight device
-            attn_output = attn_output.to(self.proj.weight.device)
         else:
-            # Other implementations: Process each chunk separately
+            # Other implementations (sdpa, etc): Process each chunk separately with packed format
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             splits = [
                 torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
@@ -495,14 +491,21 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         # so the unique_consecutive dedup is no longer needed.
 
         # Constrain window_index size (u7) so torch.export knows it's nonzero.
-        torch._check_is_size(window_index.shape[0])
-        torch._check(window_index.shape[0] > 0)
+        # Use symbolic shape operations for export compatibility
+        window_size = window_index.shape[0]
+        # Skip constraints during ONNX export to avoid data-dependent errors
+        if not torch.onnx.is_in_onnx_export():
+            torch._check_is_size(window_size)
+            torch._check(window_size > 0)
 
         seq_len, embed_dim = hidden_states.size()
         smu = self.spatial_merge_unit
         # Constrain seq_len: divisible by spatial_merge_unit, and nonzero.
-        torch._check(hidden_states.shape[0] > 0)
-        torch._check(seq_len % smu == 0)
+        # Skip int() conversion during export
+        if not torch.onnx.is_in_onnx_export():
+            seq_len_int = int(hidden_states.shape[0])
+            torch._check(seq_len_int > 0)
+            torch._check(int(seq_len % smu) == 0)
 
         hidden_states = hidden_states.reshape(seq_len // smu, smu, embed_dim)
         hidden_states = hidden_states[window_index, :, :]
@@ -512,7 +515,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
 
         pos_dim = rotary_pos_emb.shape[-1]
         rpe_len = rotary_pos_emb.shape[0]
-        torch._check(rpe_len % smu == 0)
+        torch._check(int(rpe_len % smu) == 0)
         rotary_pos_emb = rotary_pos_emb.reshape(rpe_len // smu, smu, pos_dim)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
         rotary_pos_emb = rotary_pos_emb.reshape(n_win * smu, pos_dim)
@@ -918,6 +921,12 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
+        r"""
+        Args:
+            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+                Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+                cache in the correct position and to infer the complete sequence length.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1410,6 +1419,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             The temporal, height and width of feature shape of each video in LLM.
         rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
             The rope index difference between sequence length and multimodal rope.
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+            cache in the correct position and to infer the complete sequence length.
         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
             The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
         """
@@ -1592,6 +1604,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             The temporal, height and width of feature shape of each video in LLM.
         rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
             The rope index difference between sequence length and multimodal rope.
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+            cache in the correct position and to infer the complete sequence length.
         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
             The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
 

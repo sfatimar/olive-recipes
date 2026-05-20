@@ -125,7 +125,7 @@ def _reinit_inv_freq(model):
 def get_vision_model(model_path=None):
     model = Qwen2_5_VLModel.from_pretrained(
         model_path,
-        attn_implementation="sdpa",
+        attn_implementation="eager",  # Use eager to decompose MHA into standard ops
         trust_remote_code=True,
         torch_dtype=torch.float32,
     )
@@ -141,12 +141,12 @@ def get_vision_io_config(model_path=None):
     images in a single call.  The RenameInputDims graph surgery in the Olive
     config labels dim-0 of image_grid_thw as 'num_images' in the final ONNX.
 
-    Requires torch >= 2.10 for reliable dynamo export with dynamic_shapes.
+    Uses dynamic_axes for legacy exporter compatibility.
     """
     return {
         "input_names": ["pixel_values", "image_grid_thw"],
         "output_names": ["image_features"],
-        "dynamic_shapes": {
+        "dynamic_axes": {
             "pixel_values": {0: "num_patches"},
             "image_grid_thw": {0: "num_images"},
         },
